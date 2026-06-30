@@ -1,229 +1,11 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::while_float,
-    clippy::cast_possible_truncation
-)]
+#![allow(clippy::cast_possible_truncation)]
 
 use std::{cmp::Reverse, time::Instant};
 
 use anyhow::{Context, ensure};
-use indicatif::{ProgressBar, ProgressStyle};
-use rand::{Rng, SeedableRng};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(transparent)]
-struct Matrix {
-    data: Vec<Vec<u32>>,
-}
-
-fn cost_function(order: &[u16], matrix: &Matrix) -> u64 {
-    const BLOCK_SIZE: usize = 4;
-
-    (BLOCK_SIZE..order.len() - BLOCK_SIZE)
-        .into_par_iter()
-        .map(|i| {
-            let matrix_row = &matrix.data[order[i] as usize][..];
-            let cost_a = order[i + BLOCK_SIZE..]
-                .iter()
-                .map(|&j| u64::from(matrix_row[j as usize]))
-                .sum::<u64>();
-            let cost_b = order[..i - BLOCK_SIZE]
-                .iter()
-                .map(|&j| u64::from(matrix_row[j as usize]))
-                .sum::<u64>();
-            cost_a + cost_b
-        })
-        .sum()
-}
-
-fn cost_difference_for_swap(order: &[u16], matrix: &Matrix, i: usize, j: usize) -> i64 {
-    const BLOCK_SIZE: usize = 4;
-    let n = order.len();
-    let mut diff = 0i64;
-
-    // Only recalculate for positions affected by the swap
-    for pos in 0..n {
-        if pos < BLOCK_SIZE || pos >= n - BLOCK_SIZE {
-            continue;
-        }
-
-        let elem_at_pos = order[pos] as usize;
-
-        // Check if this position's cost is affected by the swap
-        let affects_i = (i >= pos + BLOCK_SIZE || i < pos - BLOCK_SIZE) && pos != i;
-        let affects_j = (j >= pos + BLOCK_SIZE || j < pos - BLOCK_SIZE) && pos != j;
-
-        if affects_i {
-            let old_cost = i64::from(matrix.data[elem_at_pos][order[i] as usize]);
-            let new_cost = i64::from(matrix.data[elem_at_pos][order[j] as usize]);
-            diff += new_cost - old_cost;
-        }
-
-        if affects_j {
-            let old_cost = i64::from(matrix.data[elem_at_pos][order[j] as usize]);
-            let new_cost = i64::from(matrix.data[elem_at_pos][order[i] as usize]);
-            diff += new_cost - old_cost;
-        }
-
-        // If pos is i or j, recalculate its contribution entirely
-        if pos == i || pos == j {
-            // Calculate old contribution
-            let old_elem = order[pos] as usize;
-            let new_elem = order[if pos == i { j } else { i }] as usize;
-
-            for (k, o_k) in order.iter().enumerate() {
-                if k >= pos + BLOCK_SIZE || k < pos.saturating_sub(BLOCK_SIZE) {
-                    diff -= i64::from(matrix.data[old_elem][*o_k as usize]);
-                    diff += i64::from(matrix.data[new_elem][*o_k as usize]);
-                }
-            }
-        }
-    }
-
-    diff
-}
-
-fn greedy_sort(order: &mut [u16], matrix: &Matrix) {
-    let start = Instant::now();
-    let mut changed = true;
-    let mut cost = cost_function(order, matrix);
-    let mut improvements = 0;
-    let mut iters = 0u64;
-    while changed {
-        changed = false;
-        for i in 0..order.len() - 1 {
-            for j in i + 1..order.len() {
-                iters += 1;
-                let delta = cost_difference_for_swap(order, matrix, i, j);
-                if delta >= 0 {
-                    continue; // Skip if swap does not improve cost
-                }
-                order.swap(i, j);
-                cost = cost.wrapping_add_signed(delta);
-                changed = true;
-                improvements += 1;
-            }
-        }
-    }
-    println!(
-        "Greedy sort completed in {:.2}s with {improvements} improvements and {iters} iterations. Final cost: {cost}",
-        start.elapsed().as_secs_f64(),
-    );
-}
-
-fn swap_two(rng: &mut impl Rng, order: &mut [u16]) -> (usize, usize) {
-    let len = order.len();
-    let i = rng.random_range(0..len);
-    let mut j = rng.random_range(0..len);
-    while j == i {
-        j = rng.random_range(0..len);
-    }
-    order.swap(i, j);
-    (i, j)
-}
-
-const fn undo_swap(order: &mut [u16], (i, j): (usize, usize)) {
-    order.swap(i, j);
-}
-
-fn reverse_segment(rng: &mut impl Rng, order: &mut [u16]) -> (usize, usize) {
-    let len = order.len();
-    let mut start = rng.random_range(0..len);
-    let mut end = rng.random_range(0..len);
-    while end == start {
-        end = rng.random_range(0..len);
-    }
-    if start > end {
-        (start, end) = (end, start);
-    }
-    order[start..=end].reverse();
-    (start, end)
-}
-
-fn undo_reverse_segment(order: &mut [u16], (start, end): (usize, usize)) {
-    order[start..=end].reverse();
-}
-
-fn swap_local(rng: &mut impl Rng, order: &mut [u16]) -> (usize, usize) {
-    let len = order.len();
-    let i = rng.random_range(0..len - 1);
-    let j = i + 1;
-    order.swap(i, j);
-    (i, j)
-}
-
-fn simulated_annealing(
-    order: &mut [u16],
-    matrix: &Matrix,
-    rng: &mut impl Rng,
-    initial_temp: f64,
-    cooling_rate: f64,
-    min_temp: f64,
-) {
-    let start = Instant::now();
-    let mut current_cost = cost_function(order, matrix);
-    let mut best_cost = current_cost;
-    let mut best_order = order.to_vec();
-    let mut temp = initial_temp;
-    let mut iterations = 0u64;
-    let mut improvements = 0;
-
-    let mutators = [swap_local, swap_two, reverse_segment];
-    let reversers = [undo_swap, undo_swap, undo_reverse_segment];
-
-    // Calculate total iterations: initial_temp * cooling_rate^n = min_temp
-    // => n = log(min_temp / initial_temp) / log(cooling_rate)
-    let total_iterations = ((min_temp / initial_temp).ln() / cooling_rate.ln()).ceil() as u64;
-
-    let pb = ProgressBar::new(total_iterations);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} (T={msg}) ETA: {eta}")
-            .expect("valid template")
-            .progress_chars("#>-"),
-    );
-
-    while temp > min_temp {
-        let operation = rng.random_range(0..mutators.len());
-        let u = mutators[operation](rng, order);
-        let new_cost = cost_function(order, matrix);
-        let delta_energy = new_cost as f64 - current_cost as f64;
-
-        // if energy has gone up, then exp(-delta_energy / temp) is greater than 1
-        // otherwise, it is some number between 0 and 1. We always accept edits
-        // that lower the energy, and accept some that raise it based on the temperature.
-        // This is the essence of simulated annealing.
-        if delta_energy < 0.0 || (-delta_energy / temp).exp() > rng.random::<f64>() {
-            // Accept the new order
-            current_cost = new_cost;
-            if current_cost < best_cost {
-                best_cost = current_cost;
-                best_order.copy_from_slice(order);
-                improvements += 1;
-            }
-        } else {
-            // Undo the operation
-            reversers[operation](order, u);
-        }
-
-        temp *= cooling_rate;
-        iterations += 1;
-
-        if iterations.is_multiple_of(1_000) {
-            pb.set_position(iterations);
-            pb.set_message(format!("{temp:.2e}"));
-        }
-    }
-
-    pb.finish_and_clear();
-    order.copy_from_slice(&best_order);
-    println!(
-        "Simulated annealing completed in {:.2}s with {improvements} improvements and {iterations} iterations. Final cost: {best_cost}",
-        start.elapsed().as_secs_f64()
-    );
-}
+use permuter::{Matrix, cost_function, greedy_sort, simulated_annealing};
+use rand::SeedableRng;
 
 fn main() -> anyhow::Result<()> {
     let start = Instant::now();
@@ -249,9 +31,11 @@ fn main() -> anyhow::Result<()> {
 
     let default_order = (0..diag.len() as u16).collect::<Vec<_>>();
 
-    // sorting by absolute counts is already a very good heuristic.
     let mut sorted_indices = default_order.clone();
     sorted_indices.sort_unstable_by_key(|&i| Reverse(diag[i as usize]));
+
+    std::fs::write("sorted_order.json", serde_json::to_string(&sorted_indices)?)
+        .context("Failed to write sorted_order.json")?;
 
     println!(
         "Cost of default order: {}",
@@ -262,8 +46,7 @@ fn main() -> anyhow::Result<()> {
         cost_function(&sorted_indices, &matrix)
     );
 
-    // let mut greedy_order = default_order.clone();
-    // greedy_sort(&mut greedy_order, &matrix);
+    let recompute = std::env::args().any(|arg| arg == "--recompute");
 
     let mut annealed_order = sorted_indices.clone();
     simulated_annealing(
@@ -273,11 +56,11 @@ fn main() -> anyhow::Result<()> {
         1000.0,   // Initial temperature
         0.999999, // Cooling rate
         1e-6,     // Minimum temperature
+        recompute,
     );
 
     greedy_sort(&mut annealed_order, &matrix);
 
-    // Save the final order to a file
     std::fs::write("final_order.json", serde_json::to_string(&annealed_order)?)
         .context("Failed to write final_order.json")?;
 
