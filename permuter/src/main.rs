@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
 
     let default_order = (0..diag.len() as u16).collect::<Vec<_>>();
 
+    // sorting by absolute counts is already a very good heuristic.
     let mut sorted_indices = default_order.clone();
     sorted_indices.sort_unstable_by_key(|&i| Reverse(diag[i as usize]));
 
@@ -61,6 +62,7 @@ fn main() -> anyhow::Result<()> {
 
     greedy_sort(&mut annealed_order, &matrix);
 
+    // Save the final order to a file
     std::fs::write("final_order.json", serde_json::to_string(&annealed_order)?)
         .context("Failed to write final_order.json")?;
 
